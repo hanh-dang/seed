@@ -9,10 +9,28 @@
     "schema": ""
   },
   {
+    "display_name": "Address",
+    "to_field": "Address",
+    "to_table_name": "PropertyState",
+    "from_field": "Address",
+    "units": "",
+    "type": "string",
+    "schema": ""
+  },
+  {
     "display_name": "Address Line 1",
     "to_field": "address_line_1",
     "to_table_name": "PropertyState",
     "from_field": "address1",
+    "units": "",
+    "type": "string",
+    "schema": ""
+  },
+  {
+    "display_name": "Address 2",
+    "to_field": "Address 2",
+    "to_table_name": "PropertyState",
+    "from_field": "address_2",
     "units": "",
     "type": "string",
     "schema": ""
@@ -234,8 +252,8 @@
     "schema": "bedes"
   },
   {
-    "display_name": "Owner Telephone",
-    "to_field": "owner_telephone",
+    "display_name": "Telephone",
+    "to_field": "telephone",
     "to_table_name": "PropertyState",
     "from_field": "Phone",
     "units": "",
@@ -441,8 +459,8 @@
     "schema": ""
   },
   {
-    "display_name": "State Province",
-    "to_field": "state_province",
+    "display_name": "State",
+    "to_field": "state",
     "to_table_name": "PropertyState",
     "from_field": "state",
     "units": "",
