@@ -272,16 +272,20 @@ class TestMatching(DataMappingBaseTestCase):
         self.assertEqual(pal.description, 'Automatic Merge')
 
     def test_filter_duplicated_states(self):
+        first_ps = None
         for i in range(10):
-            self.property_state_factory.get_property_state(
+            ps = self.property_state_factory.get_property_state(
                 no_default_data=True,
                 address_line_1='123 The Same Address',
                 # extra_data={"extra_1": "value_%s" % i},
                 import_file_id=self.import_file.id,
                 data_state=DATA_STATE_MAPPING,
             )
+            if i == 0:
+                first_ps = ps
+
         for i in range(5):
-            self.property_state_factory.get_property_state(
+            ps = self.property_state_factory.get_property_state(
                 import_file_id=self.import_file.id,
                 data_state=DATA_STATE_MAPPING,
             )
@@ -291,6 +295,8 @@ class TestMatching(DataMappingBaseTestCase):
 
         # There should be 6 uniq states. 5 from the second call, and one of 'The Same Address'
         self.assertEqual(len(uniq_states), 6)
+        # make sure that the first item is the duplicate state
+        self.assertEqual(uniq_states[0], first_ps)
         self.assertEqual(len(dup_states), 9)
 
     def test_match_and_merge_unmatched_objects_all_unique(self):

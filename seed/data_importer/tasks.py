@@ -22,6 +22,7 @@ from celery import chord, shared_task
 from celery.utils.log import get_task_logger
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError
+from django.db.models import Count
 from django.db.models import Q
 from django.utils import timezone
 from django.utils.timezone import make_naive
@@ -362,7 +363,8 @@ def map_row_chunk(ids, file_pk, source_type, prog_key, **kwargs):
                                       include_extra_data=False):
                     # Skip this object as it has no data...
                     _log.warn(
-                        "Skipping property or taxlot during mapping because it is identical to another row")
+                        "Skipping property or taxlot during mapping because it is identical to another row"
+                    )
                     continue
 
                 try:
@@ -794,29 +796,39 @@ def hash_state_object(obj, include_extra_data=True):
 
 def filter_duplicated_states(unmatched_states):
     """
-    Takes a list of states, where some values may contain the same data
-    as others, and returns two lists.  The first list consists of a
-    single state for each equivalent set of states in
-    unmatched_states.  The second list consists of all the
-    non-representative states which (for example) could be deleted.
+    Query the unmatched_states and find if any are duplicates. If so, then tag them to be removed.
+    If there are duplicates, then the first ID of the duplicates is taken as the "one to use".
 
-    :param unmatched_states: List, unmatched states
-    :return:
+    :param unmatched_states: QuerySet, unmatched states
+    :return: list, unique and duplicate querysets
     """
+    unique = []
+    duplicates = []
 
-    # TODO #239: Should we save the hash in the database, wouldn't that be faster
-    hash_values = map(hash_state_object, unmatched_states)
-    equality_classes = collections.defaultdict(list)
+    # Query the database for where the hash_objects are duplicates
+    data = unmatched_states.values('hash_object').annotate(count=Count('hash_object'))
+    for datum in data:
+        if datum['count'] == 1:
+            unique.append(datum['hash_object'])
+        elif datum['count'] > 1:
+            duplicates.append(datum['hash_object'])
+        else:
+            raise Exception("Query for hash_object returned zero, somehow")
 
-    for (ndx, hashval) in enumerate(hash_values):
-        equality_classes[hashval].append(ndx)
+    keep_dup_ids = []
+    remove_dup_ids = []
+    for duplicate in duplicates:
+        dup_query = unmatched_states.filter(hash_object=duplicate).order_by('id')
+        ids = dup_query.values_list('id', flat=True)
+        keep_dup_ids.append(ids[0])
+        remove_dup_ids += ids[1:]
 
-    canonical_states = [unmatched_states[equality_list[0]] for equality_list in
-                        equality_classes.values()]
-    canonical_state_ids = set([s.pk for s in canonical_states])
-    noncanonical_states = [u for u in unmatched_states if u.pk not in canonical_state_ids]
+    unique_qs = unmatched_states.filter(
+        Q(hash_object__in=unique) | Q(id__in=keep_dup_ids)
+    ).order_by('id')
+    duplicates_qs = unmatched_states.filter(id__in=remove_dup_ids).order_by('id')
 
-    return canonical_states, noncanonical_states
+    return unique_qs, duplicates_qs
 
 
 def match_and_merge_unmatched_objects(unmatched_states, partitioner):
@@ -828,9 +840,6 @@ def match_and_merge_unmatched_objects(unmatched_states, partitioner):
     :param partitioner: instance of EquivalencePartitioner
     :return: [list, list], merged_objects, equivalence_classes keys
     """
-    # Sort unmatched states/This should not be happening!
-    unmatched_states.sort(key=lambda state: state.pk)
-
     def getattrdef(obj, attr, default):
         if hasattr(obj, attr):
             return getattr(obj, attr)
