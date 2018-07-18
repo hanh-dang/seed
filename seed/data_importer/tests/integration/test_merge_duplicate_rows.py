@@ -106,6 +106,25 @@ class TestCaseMultipleDuplicateMatching(DataMappingBaseTestCase):
         print ps2.hash_object
         self.assertEqual(ps1.hash_object, ps2.hash_object)
 
+    def test_hash_quantity_unicode(self):
+        """The hashing should not affect the data_state, source, type and various other states"""
+        ps1 = PropertyState.objects.create(
+            organization=self.org,
+            address_line_1='123 fake st',
+            extra_data={"a": "result", u"Site EUI²": 90.5, "Unicode in value": u"EUI²"},
+            data_state=DATA_STATE_IMPORT,
+            import_file_id=0,
+        )
+        ps2 = PropertyState.objects.create(
+            organization=self.org,
+            address_line_1='123 fake st',
+            extra_data={"a": "result", u"Site EUI2": 90.5, "Unicode in value": "EUI2"},
+            data_state=DATA_STATE_IMPORT,
+            import_file_id=0,
+        )
+        # print ps1.hash_object
+        self.assertEqual(ps1.hash_object, ps2.hash_object)
+
     def test_hash_release_date(self):
         """The hash_state_object method makes the timezones naive, so this should work because
         the date times are equivalent, even through the database objects are not"""
