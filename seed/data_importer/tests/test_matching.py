@@ -14,13 +14,16 @@ from seed.data_importer.tasks import (
     match_buildings,
     save_state_match,
     filter_duplicated_states,
-    match_and_merge_unmatched_objects,
+    match_and_merge_unmatched_property_states,
+    match_and_merge_unmatched_taxlot_states,
+    merge_unmatched_into_views,
 )
 from seed.models import (
     PropertyView,
     PropertyAuditLog,
     ASSESSED_RAW,
     DATA_STATE_MAPPING,
+    DATA_STATE_DELETE,
     MERGE_STATE_MERGED,
     TaxLotProperty,
     TaxLotView,
@@ -298,27 +301,20 @@ class TestMatching(DataMappingBaseTestCase):
         # make sure that the first item is the duplicate state
         self.assertEqual(uniq_states[0], first_ps)
         self.assertEqual(len(dup_states), 9)
+        self.assertEqual(dup_states[0].data_state, DATA_STATE_DELETE)
 
     def test_match_and_merge_unmatched_objects_all_unique(self):
-        # create some objects to match and merge
-        partitioner = EquivalencePartitioner.make_default_state_equivalence(PropertyState)
-
         for i in range(10):
             self.property_state_factory.get_property_state(
                 import_file_id=self.import_file.id,
                 data_state=DATA_STATE_MAPPING,
             )
 
-        props = self.import_file.find_unmatched_property_states()
-        uniq_states, dup_states = filter_duplicated_states(props)
-        merged, keys = match_and_merge_unmatched_objects(uniq_states, partitioner)
+        merged = match_and_merge_unmatched_property_states(self.import_file.id)
 
         self.assertEqual(len(merged), 10)
 
     def test_match_and_merge_unmatched_objects_with_duplicates(self):
-        # create some objects to match and merge
-        partitioner = EquivalencePartitioner.make_default_state_equivalence(PropertyState)
-
         for i in range(8):
             self.property_state_factory.get_property_state(
                 import_file_id=self.import_file.id,
@@ -343,16 +339,14 @@ class TestMatching(DataMappingBaseTestCase):
             data_state=DATA_STATE_MAPPING,
         )
 
-        props = self.import_file.find_unmatched_property_states()
-        uniq_states, dup_states = filter_duplicated_states(props)
-        merged, keys = match_and_merge_unmatched_objects(uniq_states, partitioner)
+        objects = match_and_merge_unmatched_property_states(self.import_file.id)
 
-        self.assertEqual(len(merged), 9)
-        self.assertEqual(len(keys), 9)
+        self.assertEqual(len(objects), 9)
 
         # find the ps_cp_1 in the list of merged
         found = False
-        for ps in merged:
+        for ps in objects:
+            print ps.site_eui
             if ps.extra_data.get('moniker', None) == '12345':
                 found = True
                 self.assertEqual(ps.site_eui.magnitude, 150)  # from the second record
@@ -361,9 +355,6 @@ class TestMatching(DataMappingBaseTestCase):
     def test_match_and_merge_unmatched_objects_with_dates(self):
         # Make sure that the dates sort correctly! (only testing release_date, but also sorts
         # on generation_date, then pk
-
-        partitioner = EquivalencePartitioner.make_default_state_equivalence(PropertyState)
-
         self.property_state_factory.get_property_state(
             no_default_data=True,
             address_line_1='123 same address',
@@ -391,9 +382,7 @@ class TestMatching(DataMappingBaseTestCase):
             data_state=DATA_STATE_MAPPING,
         )
 
-        props = self.import_file.find_unmatched_property_states()
-        uniq_states, dup_states = filter_duplicated_states(props)
-        merged, keys = match_and_merge_unmatched_objects(uniq_states, partitioner)
+        merged = match_and_merge_unmatched_property_states(self.import_file.id)
 
         found = False
         for ps in merged:
@@ -403,10 +392,59 @@ class TestMatching(DataMappingBaseTestCase):
 
     def test_merge_unmatched_into_views_no_matches(self):
         """It is very unlikely that any of these states will match since it is using faker."""
-        for i in range(10):
-            self.property_state_factory.get_property_state(
-                import_file_id=self.import_file.id,
-                data_state=DATA_STATE_MAPPING,
+
+        # Create 4 UBID view objecgs
+        for ubid in ['a1', 'b2', 'c3', 'd4']:
+            self.property_view_factory.get_property_view(
+                ubid=ubid
             )
 
-        # merge_unmatched_into_views(unmatched_states, partitioner, org, import_file):
+        new_import_file = self.import_file
+        new_import_file.pk = None
+        new_import_file.save()
+
+        # Create new data for the ubid with a new import file id
+        self.property_state_factory.get_property_state(
+            no_default_data=True,
+            extra_data={'moniker': '12345'},
+            site_eui=25,
+            ubid='a1',
+            import_file_id=new_import_file.id,
+            data_state=DATA_STATE_MAPPING,
+        )
+
+        # Create a couple propery views with the same UBID
+        partitioner = EquivalencePartitioner.make_propertystate_equivalence()
+        objects = match_and_merge_unmatched_property_states(self.import_file.id)
+        merges = merge_unmatched_into_views(objects, partitioner, self.org, self.import_file)
+
+        self.assertEqual(len(merges), 1)
+        self.assertEqual(merges[0].state.site_eui.magnitude, 25)
+
+    def test_merge_unmatched_into_views_taxlots(self):
+        # Create 4 UBID view objecgs
+        for jtl in ['a1', 'b2', 'c3', 'd4']:
+            self.taxlot_view_factory.get_taxlot_view(
+                jurisdiction_tax_lot_id=jtl
+            )
+
+        new_import_file = self.import_file
+        new_import_file.pk = None
+        new_import_file.save()
+
+        # Create new data for the ubid with a new import file id
+        self.taxlot_state_factory.get_taxlot_state(
+            no_default_data=True,
+            extra_data={'moniker': '12345'},
+            jurisdiction_tax_lot_id='a1',
+            import_file_id=new_import_file.id,
+            data_state=DATA_STATE_MAPPING,
+        )
+
+        # Create a couple propery views with the same UBID
+        partitioner = EquivalencePartitioner.make_taxlotstate_equivalence()
+        objects = match_and_merge_unmatched_taxlot_states(self.import_file.id)
+        merges = merge_unmatched_into_views(objects, partitioner, self.org, self.import_file)
+
+        self.assertEqual(len(merges), 1)
+        self.assertEqual(merges[0].state.extra_data, {'moniker': '12345'})

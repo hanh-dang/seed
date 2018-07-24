@@ -67,6 +67,19 @@ class TestEquivalenceClassGenerator(DataMappingBaseTestCase):
         equivalence_classes = partitioner.calculate_equivalence_classes([p5, p7])
         self.assertEqual(len(equivalence_classes), 1)
 
+    def test_cross_field_equivalence(self):
+        partitioner = EquivalencePartitioner.make_propertystate_equivalence()
+
+        p1 = PropertyState(custom_id_1='100')
+        p2 = PropertyState(ubid='100')
+        p3 = PropertyState(ubid='100')
+
+        equivalence_classes = partitioner.calculate_equivalence_classes([p1, p2])
+        self.assertEqual(len(equivalence_classes), 2)
+
+        equivalence_classes = partitioner.calculate_equivalence_classes([p1, p2, p3])
+        self.assertEqual(len(equivalence_classes), 2)
+
     def test_a_dummy_class_basics(self):
         tls1 = TaxLotState(jurisdiction_tax_lot_id="1")
         tls2 = TaxLotState(jurisdiction_tax_lot_id="1", custom_id_1="100")

@@ -22,8 +22,8 @@ from celery import chord, shared_task
 from celery.utils.log import get_task_logger
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError
-from django.db.models import Count
-from django.db.models import Q
+from django.db.models import Case, When
+from django.db.models import Count, Q
 from django.utils import timezone
 from django.utils.timezone import make_naive
 from unidecode import unidecode
@@ -473,12 +473,6 @@ def _data_quality_check_create_tasks(org_id, property_state_ids, taxlot_state_id
     return tasks
 
 
-@shared_task(ignore_result=True)
-def junk_test(x, y):
-    print "now i am here"
-    return x * y
-
-
 def map_data(import_file_id, remap=False, mark_as_done=True):
     """
     Map data task. By default this method will run through the mapping and mark it as complete.
@@ -831,55 +825,311 @@ def filter_duplicated_states(unmatched_states):
     ).order_by('id')
     duplicates_qs = unmatched_states.filter(id__in=remove_dup_ids).order_by('id')
 
+    # go through and mark up the duplicates so that they are not used in the subsequent queries
+    for dup in duplicates_qs:
+        dup.data_state = DATA_STATE_DELETE
+        dup.save()
+
+    # The result of this is pointless to be honest. The next query gets everything out of a
+    # raw sql query. This just marks the items to delete.
     return unique_qs, duplicates_qs
 
 
-def match_and_merge_unmatched_objects(unmatched_states, partitioner):
+def match_and_merge_unmatched_property_states(import_file_id):
     """
-    Take a list of unmatched_property_states or unmatched_tax_lot_states and returns a set of
-    states that correspond to unmatched states.
+    Find and merge within an import file all the records that are the same.
 
-    :param unmatched_states: list, PropertyStates or TaxLotStates
-    :param partitioner: instance of EquivalencePartitioner
-    :return: [list, list], merged_objects, equivalence_classes keys
+    :param import_file_id: int, ID of the file to match and merge
+    :return: list, objects that were merged
     """
-    def getattrdef(obj, attr, default):
-        if hasattr(obj, attr):
-            return getattr(obj, attr)
+    sql = """
+        WITH concat_fields AS (
+          -- The ubid is the same
+          -- pm_property_id is the same, # used to check if pm_property_id was in custom_id_1, not anymore!
+          -- custom_id_1 is the same
+          -- normalized_address is the same
+          SELECT
+            id,
+            coalesce(ubid, random()::text) as ubid,
+            coalesce(pm_property_id, random()::text) AS pm_property_id,
+            coalesce(custom_id_1, random()::text) as custom_id_1,
+            coalesce(normalized_address, random()::text) as normalized_address,
+            release_date,
+            generation_date
+          FROM seed_propertystate
+          WHERE data_state = %s and import_file_id = %s
+          ), with_counts AS (
+          SELECT
+            *,
+            count(cf.ubid) OVER (PARTITION BY cf.ubid) AS ubid_count,
+            count(cf.pm_property_id) OVER (PARTITION BY cf.pm_property_id) AS pm_property_id_count,
+            count(cf.normalized_address) OVER (PARTITION BY cf.normalized_address) AS normalized_address_count,
+            count(cf.custom_id_1) OVER (PARTITION BY cf.custom_id_1) AS custom_id_count
+          FROM concat_fields cf
+        ), qry_ubid AS (
+          SELECT
+              wc.ubid,
+              array_agg(wc.id order by release_date ASC, generation_date asc, id asc) as ubid_agg,
+              max(wc.ubid_count) as ubid_count
+            FROM with_counts wc
+            GROUP BY wc.ubid
+        ), qry_pm_property_id AS (
+            SELECT
+              wc.pm_property_id,
+              array_agg(wc.id order by release_date ASC, generation_date asc, id asc) as pm_property_id_agg,
+              max(wc.pm_property_id_count) as pm_property_id_count
+            FROM with_counts wc
+            GROUP BY wc.pm_property_id
+        ), qry_custom AS (
+            SELECT
+              wc.custom_id_1,
+              array_agg(wc.id order by release_date ASC, generation_date asc, id asc) as custom_id_agg,
+              max(wc.custom_id_count) as custom_id_count
+            FROM with_counts wc
+            GROUP BY wc.custom_id_1
+        ), qry_address AS (
+          SELECT
+              wc.normalized_address,
+              array_agg(wc.id order by release_date ASC, generation_date asc, id asc) as normalized_address_agg,
+              max(wc.normalized_address_count) as normalized_address_count
+            FROM with_counts wc
+            GROUP BY wc.normalized_address
+        ), priority_ubid AS (
+          SELECT
+            DISTINCT ON (qry_ubid.ubid_agg) qry_ubid.ubid_agg as ubid_agg,
+            with_counts.id,
+            qry_pm_property_id.pm_property_id_agg,
+            qry_address.normalized_address_agg,
+            qry_custom.custom_id_agg,
+            with_counts.ubid,
+            with_counts.custom_id_1,
+            with_counts.normalized_address,
+            with_counts.pm_property_id,
+            qry_ubid.ubid_count,
+            qry_pm_property_id.pm_property_id_count,
+            qry_address.normalized_address_count,
+            with_counts.release_date
+          FROM with_counts
+            LEFT JOIN qry_ubid on (qry_ubid.ubid = with_counts.ubid)
+            LEFT JOIN qry_pm_property_id ON (qry_pm_property_id.pm_property_id = with_counts.pm_property_id)
+            LEFT JOIN qry_custom ON (qry_custom.custom_id_1 = with_counts.custom_id_1)
+            LEFT JOIN qry_address on (qry_address.normalized_address = with_counts.normalized_address)
+        ), priority_cat_pm_custom AS (
+          SELECT DISTINCT ON (priority_ubid.pm_property_id_agg) priority_ubid.pm_property_id_agg as pm_property_id_agg,
+            id,
+            ubid_agg,
+            normalized_address_agg,
+            custom_id_agg,
+            ubid,
+            custom_id_1,
+            normalized_address,
+            pm_property_id,
+            ubid_count,
+            pm_property_id_count,
+            normalized_address_count,
+            release_date
+          FROM priority_ubid
+        ), priority_normalized_address AS (
+          SELECT DISTINCT ON (priority_cat_pm_custom.normalized_address_agg) priority_cat_pm_custom.normalized_address_agg as address_agg,
+            id,
+            ubid_agg,
+            pm_property_id_agg,
+            normalized_address_agg,
+            custom_id_agg,
+            ubid,
+            custom_id_1,
+            normalized_address,
+            pm_property_id,
+            ubid_count,
+            pm_property_id_count,
+            normalized_address_count,
+            release_date
+          FROM priority_cat_pm_custom
+        )
+          SELECT *
+          FROM priority_normalized_address;
+          """
+
+    objects = list(PropertyState.objects.raw(sql, [int(DATA_STATE_MAPPING), int(import_file_id)]))
+
+    # This could be paralleled out here... if we need more speed increases
+    final_merges = []
+    for obj in objects:
+        # print "%s | %s | %s" % (obj.ubid_agg, obj.pm_custom_agg, obj.normalized_address_agg)
+
+        # Go through and grab the objects based on the postgres array_agg method, then merge them
+        # in that order.
+        if len(obj.ubid_agg) > 1:
+            # The preserved object is magic at the moment. It forces the sorting to be the
+            # same as the *_agg result from the database.
+            preserved = Case(
+                *[When(pk=pk, then=pos) for pos, pk in enumerate(obj.ubid_agg)]
+            )
+            merge_objects = PropertyState.objects.filter(id__in=obj.ubid_agg).order_by(preserved)
+        elif len(obj.pm_property_id_agg) > 1:
+            preserved = Case(
+                *[When(pk=pk, then=pos) for pos, pk in enumerate(obj.pm_property_id_agg)]
+            )
+            merge_objects = PropertyState.objects.filter(id__in=obj.pm_property_id_agg).order_by(
+                preserved)
+        elif len(obj.custom_id_agg) > 1:
+            preserved = Case(
+                *[When(pk=pk, then=pos) for pos, pk in enumerate(obj.custom_id_agg)]
+            )
+            merge_objects = PropertyState.objects.filter(id__in=obj.custom_id_agg).order_by(
+                preserved)
+        elif len(obj.normalized_address_agg) > 1:
+            preserved = Case(
+                *[When(pk=pk, then=pos) for pos, pk in enumerate(obj.normalized_address_agg)]
+            )
+            merge_objects = PropertyState.objects.filter(
+                id__in=obj.normalized_address_agg).order_by(preserved)
         else:
-            return default
+            merge_objects = [obj]  # the object is on its own
 
-    # create lambda function to sort the properties/taxlots by release_data first, then generation_
-    # date, and finally the primary key
-    keyfunction = lambda ndx: (
-        getattrdef(unmatched_states[ndx], "release_date", None),
-        getattrdef(unmatched_states[ndx], "generation_date", None),
-        getattrdef(unmatched_states[ndx], "pk", None)
-    )
+        merge_result = merge_objects[0]
+        if len(merge_objects) > 1:
+            for merge_object in merge_objects[1:]:
+                print merge_object
+                merge_result = save_state_match(merge_result, merge_object)
 
-    # This removes any states that are duplicates,
-    equivalence_classes = partitioner.calculate_equivalence_classes(unmatched_states)
+        final_merges.append(merge_result)
 
-    # For each of the equivalence classes, merge them down to a single
-    # object of that type.
-    merged_objects = []
+    return final_merges
 
-    for (class_key, class_ndxs) in equivalence_classes.items():
-        if len(class_ndxs) == 1:
-            # If there is only one class_ndx, then just save the object to merged_objects and
-            # move on
-            merged_objects.append(unmatched_states[class_ndxs[0]])
+def match_and_merge_unmatched_taxlot_states(import_file_id):
+    """
+    Find and merge within an import file all the records that are the same.
+
+    :param import_file_id: int, ID of the file to match and merge
+    :return: list, objects that were merged
+    """
+    sql = """
+      WITH concat_fields AS (
+          -- Their jurisdiction_tax_lot_ids are the same, # which can only be in jurisdiction_tax_lot_id, used to check for its existence in custom_id_1
+          -- Their custom_id_1 fields match
+          -- Their normalized addresses match
+          SELECT
+            id,
+            coalesce(jurisdiction_tax_lot_id, random()::text) as jurisdiction_tax_lot_id,
+            coalesce(custom_id_1, random()::text) as custom_id_1,
+            coalesce(normalized_address, random()::text) as normalized_address
+          FROM seed_taxlotstate
+          WHERE data_state = %s and import_file_id = %s
+          ), with_counts AS (
+          SELECT
+            *,
+            count(cf.jurisdiction_tax_lot_id) OVER (PARTITION BY cf.jurisdiction_tax_lot_id) AS jurisdiction_tax_lot_id_count,
+            count(cf.custom_id_1) OVER (PARTITION BY cf.custom_id_1) AS custom_id_count,
+            count(cf.normalized_address) OVER (PARTITION BY cf.normalized_address) AS normalized_address_count
+          FROM concat_fields cf
+        ), qry_jurisdiction AS (
+            SELECT
+              wc.jurisdiction_tax_lot_id,
+              array_agg(wc.id order by id asc) as jurisdiction_tax_lot_id_agg,
+              max(wc.jurisdiction_tax_lot_id_count) as jurisdiction_tax_lot_id_count
+            FROM with_counts wc
+            GROUP BY wc.jurisdiction_tax_lot_id
+        ), qry_custom AS (
+          SELECT
+              wc.custom_id_1,
+              array_agg(wc.id order by id asc) as custom_id_agg,
+              max(wc.custom_id_count) as custom_id_count
+            FROM with_counts wc
+            GROUP BY wc.custom_id_1
+        ), qry_address AS (
+          SELECT
+              wc.normalized_address,
+              array_agg(wc.id order by id asc) as normalized_address_agg,
+              max(wc.normalized_address_count) as normalized_address_count
+            FROM with_counts wc
+            GROUP BY wc.normalized_address
+        ), priority_1 AS (
+          SELECT
+            DISTINCT ON (qry_jurisdiction.jurisdiction_tax_lot_id_agg) qry_jurisdiction.jurisdiction_tax_lot_id_agg as jurisdiction_tax_lot_id_agg,
+            with_counts.id,
+            qry_custom.custom_id_agg,
+            qry_address.normalized_address_agg,
+            with_counts.jurisdiction_tax_lot_id,
+            with_counts.custom_id_1,
+            with_counts.normalized_address,
+            qry_jurisdiction.jurisdiction_tax_lot_id_count,
+            qry_custom.custom_id_count,
+            qry_address.normalized_address_count
+          FROM with_counts
+            LEFT JOIN qry_jurisdiction on (qry_jurisdiction.jurisdiction_tax_lot_id = with_counts.jurisdiction_tax_lot_id)
+            LEFT JOIN qry_custom ON (qry_custom.custom_id_1 = with_counts.custom_id_1)
+            LEFT JOIN qry_address on (qry_address.normalized_address = with_counts.normalized_address)
+        ), priority_2 AS (
+          SELECT DISTINCT ON (priority_1.custom_id_agg) priority_1.custom_id_agg as custom_id_agg,
+            id,
+            jurisdiction_tax_lot_id_agg,
+            normalized_address_agg,
+            jurisdiction_tax_lot_id,
+            custom_id_1,
+            normalized_address,
+            jurisdiction_tax_lot_id_count,
+            custom_id_count,
+            normalized_address_count
+          FROM priority_1
+        ), priority_3 AS (
+          SELECT DISTINCT ON (priority_2.normalized_address_agg) priority_2.normalized_address_agg as address_agg,
+            id,
+            jurisdiction_tax_lot_id_agg,
+            custom_id_agg,
+            normalized_address_agg,
+            jurisdiction_tax_lot_id,
+            custom_id_1,
+            normalized_address,
+            jurisdiction_tax_lot_id_count,
+            custom_id_count,
+            normalized_address_count
+          FROM priority_2
+        )
+          SELECT *
+          FROM priority_3;
+          """
+
+    objects = list(TaxLotState.objects.raw(sql, [int(DATA_STATE_MAPPING), int(import_file_id)]))
+
+    # This could be paralleled out here... if we need more speed increases
+    final_merges = []
+    for obj in objects:
+        # print "%s | %s | %s" % (obj.ubid_agg, obj.pm_custom_agg, obj.normalized_address_agg)
+
+        # Go through and grab the objects based on the postgres array_agg method, then merge them
+        # in that order.
+        if len(obj.jurisdiction_tax_lot_id_agg) > 1:
+            # The preserved object is magic at the moment. It forces the sorting to be the
+            # same as the *_agg result from the database.
+            preserved = Case(
+                *[When(pk=pk, then=pos) for pos, pk in enumerate(obj.jurisdiction_tax_lot_id_agg)]
+            )
+            merge_objects = PropertyState.objects.filter(id__in=obj.jurisdiction_tax_lot_id_agg).order_by(preserved)
+        elif len(obj.custom_id_agg) > 1:
+            preserved = Case(
+                *[When(pk=pk, then=pos) for pos, pk in enumerate(obj.custom_id_agg)]
+            )
+            merge_objects = PropertyState.objects.filter(id__in=obj.custom_id_agg).order_by(
+                preserved)
+        elif len(obj.normalized_address_agg) > 1:
+            preserved = Case(
+                *[When(pk=pk, then=pos) for pos, pk in enumerate(obj.normalized_address_agg)]
+            )
+            merge_objects = PropertyState.objects.filter(
+                id__in=obj.normalized_address_agg).order_by(preserved)
         else:
-            class_ndxs.sort(key=keyfunction)
-            unmatched_state_class = [unmatched_states[ndx] for ndx in class_ndxs]
-            merged_result = unmatched_state_class[0]
-            for unmatched in unmatched_state_class[1:]:
-                merged_result = save_state_match(merged_result, unmatched)
+            merge_objects = [obj]  # the object is on its own
 
-            merged_objects.append(merged_result)
+        merge_result = merge_objects[0]
+        if len(merge_objects) > 1:
+            for merge_object in merge_objects[1:]:
+                print merge_object
+                merge_result = save_state_match(merge_result, merge_object)
 
-    return merged_objects, equivalence_classes.keys()
+        final_merges.append(merge_result)
 
+    return final_merges
 
 def merge_unmatched_into_views(unmatched_states, partitioner, org, import_file):
     """
@@ -917,18 +1167,14 @@ def merge_unmatched_into_views(unmatched_states, partitioner, org, import_file):
     existing_view_states = collections.defaultdict(dict)
     existing_view_state_hashes = set()
 
-    # TODO #239: this is an expensive calculation
     for view in class_views:
         equivalence_can_key = partitioner.calculate_canonical_key(view.state)
-        print equivalence_can_key
         existing_view_states[equivalence_can_key][view.cycle] = view
-        existing_view_state_hashes.add(hash_state_object(view.state))
+        existing_view_state_hashes.add(view.state.hash_object)
 
     matched_views = []
-
     for unmatched in unmatched_states:
-        unmatched_state_hash = hash_state_object(unmatched)
-        if unmatched_state_hash in existing_view_state_hashes:
+        if unmatched.hash_object in existing_view_state_hashes:
             # If an exact duplicate exists, delete the unmatched state
             unmatched.data_state = DATA_STATE_DELETE
             unmatched.save()
@@ -1005,12 +1251,11 @@ def _match_properties_and_taxlots(file_pk, progress_key):
     if all_unmatched_properties:
         property_partitioner = EquivalencePartitioner.make_default_state_equivalence(PropertyState)
 
-        # Filter out the duplicates within the import file.
+        # Filter out the duplicates within the import file. This method sets the
+        # DATA_STATE_DELETE flag
         _log.debug("Start filter_duplicated_states: %s" % dt.datetime.now().strftime(
             "%Y-%m-%d %H:%M:%S"))
-        unmatched_properties, duplicate_property_states = filter_duplicated_states(
-            all_unmatched_properties
-        )
+        filter_duplicated_states(all_unmatched_properties)
         _log.debug("End filter_duplicated_states: %s" % dt.datetime.now().strftime(
             "%Y-%m-%d %H:%M:%S"))
 
@@ -1018,10 +1263,7 @@ def _match_properties_and_taxlots(file_pk, progress_key):
         # provided by the partitioner, while ignoring duplicates.
         _log.debug("Start match_and_merge_unmatched_objects: %s" % dt.datetime.now().strftime(
             "%Y-%m-%d %H:%M:%S"))
-        unmatched_properties, property_equivalence_keys = match_and_merge_unmatched_objects(
-            unmatched_properties,
-            property_partitioner
-        )
+        file_merged_objects = match_and_merge_unmatched_property_states(import_file.id)
         _log.debug("End match_and_merge_unmatched_objects: %s" % dt.datetime.now().strftime(
             "%Y-%m-%d %H:%M:%S"))
 
@@ -1031,7 +1273,7 @@ def _match_properties_and_taxlots(file_pk, progress_key):
         _log.debug("Start merge_unmatched_into_views: %s" % dt.datetime.now().strftime(
             "%Y-%m-%d %H:%M:%S"))
         merged_property_views = merge_unmatched_into_views(
-            unmatched_properties,
+            file_merged_objects,
             property_partitioner,
             org,
             import_file
@@ -1052,26 +1294,20 @@ def _match_properties_and_taxlots(file_pk, progress_key):
     all_unmatched_tax_lots = import_file.find_unmatched_tax_lot_states()
 
     if all_unmatched_tax_lots:
-        # Filter out the duplicates.  Do we actually want to delete them
-        # here?  Mark their abandonment in the Audit Logs?
-        unmatched_tax_lots, duplicate_tax_lot_states = filter_duplicated_states(
-            all_unmatched_tax_lots)
-
         taxlot_partitioner = EquivalencePartitioner.make_default_state_equivalence(TaxLotState)
+
+        filter_duplicated_states(all_unmatched_tax_lots)
 
         # Merge everything together based on the notion of equivalence
         # provided by the partitioner.
-        unmatched_tax_lots, taxlot_equivalence_keys = match_and_merge_unmatched_objects(
-            unmatched_tax_lots,
-            taxlot_partitioner
-        )
+        file_merged_objects = match_and_merge_unmatched_taxlot_states(import_file.id)
 
         # Take the final merged-on-import objects, and find Views that
         # correspond to it and merge those together.
         _log.debug("Start tax_lot merge_unmatched_into_views: %s" % dt.datetime.now().strftime(
             "%Y-%m-%d %H:%M:%S"))
         merged_taxlot_views = merge_unmatched_into_views(
-            unmatched_tax_lots,
+            file_merged_objects,
             taxlot_partitioner,
             org,
             import_file
@@ -1109,19 +1345,14 @@ def _match_properties_and_taxlots(file_pk, progress_key):
             state.merge_state = MERGE_STATE_NEW
         state.save()
 
-    for state in chain(duplicate_property_states, duplicate_tax_lot_states):
-        state.data_state = DATA_STATE_DELETE
-        # state.merge_state = MERGE_STATE_DUPLICATE
-        state.save()
-
     return {
         'import_file_records': import_file.num_rows,
         'property_all_unmatched': len(all_unmatched_properties),
-        'property_duplicates': len(duplicate_property_states),
+        # 'property_duplicates': len(duplicate_property_states),
         'property_duplicates_of_existing': len(duplicates_of_existing_property_states),
         'property_unmatched': len(unmatched_properties),
         'tax_lot_all_unmatched': len(all_unmatched_tax_lots),
-        'tax_lot_duplicates': len(duplicate_tax_lot_states),
+        # 'tax_lot_duplicates': len(duplicate_tax_lot_states),
         'tax_lot_duplicates_of_existing': len(duplicates_of_existing_taxlot_states),
         'tax_lot_unmatched': len(unmatched_tax_lots),
     }
@@ -1147,6 +1378,7 @@ def list_canonical_property_states(org_id):
     return PropertyState.objects.filter(pk__in=ids)
 
 
+# TODO 1498: This doesn't appear to be used
 def query_property_matches(properties, pm_id, custom_id, ubid):
     """
     Returns query set of PropertyStates that match at least one of the specified ids
@@ -1299,6 +1531,7 @@ def pair_new_states(merged_property_views, merged_taxlot_views):
     global taxlot_m2m_keygen
     global property_m2m_keygen
 
+    # This should be easy to move to a raw database call now
     taxlot_m2m_keygen = EquivalencePartitioner(tax_cmp_fmt, ["jurisdiction_tax_lot_id"])
     property_m2m_keygen = EquivalencePartitioner(prop_cmp_fmt,
                                                  ["pm_property_id", "jurisdiction_property_id"])

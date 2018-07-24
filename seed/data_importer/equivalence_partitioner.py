@@ -89,6 +89,15 @@ class EquivalencePartitioner(object):
 
     @classmethod
     def make_propertystate_equivalence(kls):
+        """Return default EquivalencePartitioner for PropertyStatest
+
+        Two property states are identical if:
+
+        - The ubid is the same
+        - pm_property_id is the same, which can be found in the the pm_property_id or custom_id_1
+        - custom_id_1 is the same
+        - normalized_address is the same
+        """
         property_equivalence_fields = [
             ("ubid",),
             ("pm_property_id", "custom_id_1"),
