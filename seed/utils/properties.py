@@ -104,8 +104,7 @@ def pair_unpair_property_taxlot(property_id, taxlot_id, organization_id, pair):
                                                                                property_id, string)
             })
         TaxLotProperty(primary=True, cycle_id=pv_cycle, property_view_id=property_id,
-                       taxlot_view_id=taxlot_id) \
-            .save()
+                       taxlot_view_id=taxlot_id).save()
 
         success = True
     else:

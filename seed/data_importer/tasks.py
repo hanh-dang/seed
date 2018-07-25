@@ -997,6 +997,7 @@ def match_and_merge_unmatched_property_states(import_file_id):
 
     return final_merges
 
+
 def match_and_merge_unmatched_taxlot_states(import_file_id):
     """
     Find and merge within an import file all the records that are the same.
@@ -1105,7 +1106,8 @@ def match_and_merge_unmatched_taxlot_states(import_file_id):
             preserved = Case(
                 *[When(pk=pk, then=pos) for pos, pk in enumerate(obj.jurisdiction_tax_lot_id_agg)]
             )
-            merge_objects = PropertyState.objects.filter(id__in=obj.jurisdiction_tax_lot_id_agg).order_by(preserved)
+            merge_objects = PropertyState.objects.filter(
+                id__in=obj.jurisdiction_tax_lot_id_agg).order_by(preserved)
         elif len(obj.custom_id_agg) > 1:
             preserved = Case(
                 *[When(pk=pk, then=pos) for pos, pk in enumerate(obj.custom_id_agg)]
@@ -1131,6 +1133,7 @@ def match_and_merge_unmatched_taxlot_states(import_file_id):
 
     return final_merges
 
+
 def merge_unmatched_into_views(unmatched_states, partitioner, org, import_file):
     """
     This is fairly inefficient, because we grab all the organization's entire PropertyViews at once.
@@ -1153,9 +1156,17 @@ def merge_unmatched_into_views(unmatched_states, partitioner, org, import_file):
     if isinstance(unmatched_states[0], PropertyState):
         ObjectViewClass = PropertyView
         ParentAttrName = "property"
+        select_only_fields = [
+            'id', 'state__id', 'state__custom_id_1', 'state__normalized_address',
+            'state__ubid', 'state__pm_property_id'
+        ]
     elif isinstance(unmatched_states[0], TaxLotState):
         ObjectViewClass = TaxLotView
         ParentAttrName = "taxlot"
+        select_only_fields = [
+            'id', 'state__id', 'state__jurisdiction_tax_lot_id', 'state__custom_id_1',
+            'state__normalized_address'
+        ]
     else:
         raise ValueError("Unknown class '{}' passed to merge_unmatched_into_views".format(
             type(unmatched_states[0])))
@@ -1163,29 +1174,36 @@ def merge_unmatched_into_views(unmatched_states, partitioner, org, import_file):
     class_views = ObjectViewClass.objects.filter(
         state__organization=org,
         cycle_id=current_match_cycle
-    ).select_related('state')
+    ).select_related('state').only(*select_only_fields)
     existing_view_states = collections.defaultdict(dict)
     existing_view_state_hashes = set()
 
+    _log.debug("Start merge_unmatched_into_views_equivalence_calc: %s" % dt.datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"))
     for view in class_views:
         equivalence_can_key = partitioner.calculate_canonical_key(view.state)
         existing_view_states[equivalence_can_key][view.cycle] = view
         existing_view_state_hashes.add(view.state.hash_object)
+    _log.debug("End merge_unmatched_into_views_equivalence_calc: %s" % dt.datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"))
 
     matched_views = []
+    _log.debug("Start merge_unmatched_into_views_unmatched_states: %s" % dt.datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"))
+    _log.debug("Number of unmatched_states: %s" % unmatched_states)
     for unmatched in unmatched_states:
         if unmatched.hash_object in existing_view_state_hashes:
+            _log.debug("Duplicate hash_object, marking as DATA_STATE_DELETE")
             # If an exact duplicate exists, delete the unmatched state
             unmatched.data_state = DATA_STATE_DELETE
             unmatched.save()
         else:
-            # Look to see if there is a match among the property states of the object.
-
-            # equiv_key = False
-            # equiv_can_key = partitioner.calculate_canonical_key(unmatched)
+            # Look to see if there is a match among the state of the object.
             equiv_cmp_key = partitioner.calculate_comparison_key(unmatched)
 
             for key in existing_view_states:
+                # print "%s || %s" % (equiv_cmp_key, key)
+
                 if partitioner.calculate_key_equivalence(key, equiv_cmp_key):
                     if current_match_cycle in existing_view_states[key]:
                         # There is an existing View for the current cycle that matches us.
@@ -1219,6 +1237,9 @@ def merge_unmatched_into_views(unmatched_states, partitioner, org, import_file):
                 # Create a new object/view for the current object.
                 created_view = unmatched.promote(current_match_cycle)
                 matched_views.append(created_view)
+
+    _log.debug("End merge_unmatched_into_views_unmatched_states: %s" % dt.datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"))
 
     return list(set(matched_views))
 
