@@ -4,7 +4,7 @@
 # TO_BUILD_AND_RUN: docker-compose build && docker-compose up
 
 # Latest Ubuntu LTS
-FROM ubuntu:16.04
+FROM ubuntu:18.04
 
 ### Required dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
