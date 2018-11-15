@@ -384,6 +384,7 @@ angular.module('BE.seed.controller.inventory_list', [])
           options.cellFilter = 'date:\'yyyy-MM-dd h:mm a\'';
           options.filter = inventory_service.dateFilter();
         } else {
+          options.cellFilter = 'numFormatter';
           options.filter = inventory_service.combinedFilter();
           options.sortingAlgorithm = naturalSort;
         }
